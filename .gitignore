@@ -1,0 +1,14 @@
+.venv/
+downloads/*
+!downloads/.gitkeep
+__pycache__/
+*.pyc
+node_modules/
+.wrangler/
+dist/
+
+# lokal saja (skill/agent config)
+.agents/
+.claude/
+agent/
+skills-lock.json

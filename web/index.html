@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="id" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+
+    <!-- Terapkan tema/bahasa tersimpan sebelum paint supaya tidak berkedip. -->
+    <script>
+      (function () {
+        try {
+          var params = new URLSearchParams(location.search)
+          var override = params.get('theme')
+          var theme = override === 'light' || override === 'dark' ? override : localStorage.getItem('pluckdl-theme')
+          if (theme !== 'light' && theme !== 'dark') {
+            theme = matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark'
+          }
+          document.documentElement.dataset.theme = theme
+          var lang = params.get('lang') || localStorage.getItem('pluckdl-lang')
+          if (lang === 'en') document.documentElement.lang = 'en'
+        } catch (e) {}
+      })()
+    </script>
+
+    <title>Unduh Video TikTok, Threads &amp; X Tanpa Watermark — PluckDL</title>
+    <meta
+      name="description"
+      content="Unduh video dan foto TikTok, Threads, dan X tanpa watermark. Tempel tautan, platform terdeteksi otomatis, file siap diunduh. Gratis, tanpa aplikasi."
+    />
+    <meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1" />
+    <meta name="author" content="alvadyza" />
+    <meta name="application-name" content="PluckDL" />
+    <link rel="canonical" href="https://pluck.alva.web.id/" />
+    <meta name="color-scheme" content="dark light" />
+    <meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)" />
+    <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)" />
+
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="PluckDL" />
+    <meta property="og:locale" content="id_ID" />
+    <meta property="og:title" content="Unduh Video TikTok, Threads &amp; X Tanpa Watermark — PluckDL" />
+    <meta
+      property="og:description"
+      content="Tempel tautan TikTok, Threads, atau X. Platform terdeteksi otomatis, video dan foto siap diunduh tanpa watermark. Gratis, tanpa aplikasi."
+    />
+    <meta property="og:url" content="https://pluck.alva.web.id/" />
+    <meta property="og:image" content="https://pluck.alva.web.id/og.png" />
+    <meta property="og:image:type" content="image/png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="PluckDL — Paste the link. Get the media." />
+
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Unduh Video TikTok, Threads &amp; X Tanpa Watermark — PluckDL" />
+    <meta
+      name="twitter:description"
+      content="Tempel tautan TikTok, Threads, atau X. Platform terdeteksi otomatis, video dan foto siap diunduh tanpa watermark."
+    />
+    <meta name="twitter:image" content="https://pluck.alva.web.id/og.png" />
+
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230A0A0A' stroke='%23383838' stroke-width='2'/%3E%3Cpath d='M9 8v10a4 4 0 0 0 4 4h10' fill='none' stroke='%23FFFFFF' stroke-width='2.6' stroke-linecap='round'/%3E%3Cpath d='M18 8l5 5-5 5' fill='none' stroke='%23FFFFFF' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
+
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@graph": [
+          {
+            "@type": "WebApplication",
+            "@id": "https://pluck.alva.web.id/#app",
+            "name": "PluckDL",
+            "url": "https://pluck.alva.web.id/",
+            "description": "Pengunduh video dan foto TikTok, Threads, dan X tanpa watermark. Tempel tautan, platform terdeteksi otomatis, lalu file siap diunduh.",
+            "applicationCategory": "MultimediaApplication",
+            "operatingSystem": "Any",
+            "inLanguage": "id",
+            "isAccessibleForFree": true,
+            "offers": {
+              "@type": "Offer",
+              "price": "0",
+              "priceCurrency": "IDR"
+            },
+            "featureList": [
+              "Unduh video TikTok tanpa watermark",
+              "Unduh foto dan carousel dari Threads",
+              "Unduh video dan foto dari X (Twitter)",
+              "Unduh semua foto carousel sebagai ZIP"
+            ]
+          },
+          {
+            "@type": "FAQPage",
+            "@id": "https://pluck.alva.web.id/#faq",
+            "mainEntity": [
+              {
+                "@type": "Question",
+                "name": "Apakah PluckDL gratis?",
+                "acceptedAnswer": {
+                  "@type": "Answer",
+                  "text": "Ya, PluckDL gratis dipakai tanpa batas unduhan dan tanpa perlu membuat akun."
+                }
+              },
+              {
+                "@type": "Question",
+                "name": "Apakah video TikTok yang diunduh masih ada watermark?",
+                "acceptedAnswer": {
+                  "@type": "Answer",
+                  "text": "Tidak. Untuk TikTok, PluckDL mengambil versi video tanpa watermark selama versi tersebut tersedia dari sumbernya."
+                }
+              },
+              {
+                "@type": "Question",
+                "name": "Platform apa saja yang didukung?",
+                "acceptedAnswer": {
+                  "@type": "Answer",
+                  "text": "Saat ini PluckDL mendukung TikTok, Threads, dan X (Twitter), baik untuk video maupun foto."
+                }
+              },
+              {
+                "@type": "Question",
+                "name": "Apakah perlu aplikasi atau akun untuk mengunduh?",
+                "acceptedAnswer": {
+                  "@type": "Answer",
+                  "text": "Tidak perlu. Cukup buka PluckDL di browser, tempel tautan, lalu unduh. Tanpa aplikasi dan tanpa login."
+                }
+              },
+              {
+                "@type": "Question",
+                "name": "Format file apa yang tersedia?",
+                "acceptedAnswer": {
+                  "@type": "Answer",
+                  "text": "Video tersedia dalam MP4, foto dalam JPG, dan carousel bisa diunduh sekaligus sebagai ZIP."
+                }
+              }
+            ]
+          }
+        ]
+      }
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <noscript>
+      <div style="max-width: 640px; margin: 80px auto; padding: 0 20px; font-family: system-ui, sans-serif; color: #fff">
+        <h1>PluckDL — Unduh video TikTok, Threads, dan X tanpa watermark</h1>
+        <p>
+          PluckDL mengunduh video dan foto dari TikTok, Threads, dan X. Tempel tautan, platform
+          terdeteksi otomatis, lalu file siap diunduh. Gratis, tanpa aplikasi.
+        </p>
+        <p>Aktifkan JavaScript untuk memakai pengunduh.</p>
+      </div>
+    </noscript>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="id" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="robots" content="noindex" />
+    <meta name="color-scheme" content="dark light" />
+    <title>Halaman tidak ditemukan — PluckDL</title>
+    <script>
+      (function () {
+        try {
+          var theme = localStorage.getItem('pluckdl-theme')
+          if (theme !== 'light' && theme !== 'dark') {
+            theme = matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark'
+          }
+          document.documentElement.dataset.theme = theme
+        } catch (e) {}
+      })()
+    </script>
+    <style>
+      :root {
+        --base: #000;
+        --surface-2: #1a1a1a;
+        --line-3: #383838;
+        --ink: #fff;
+        --muted: #a3a3a3;
+        --faint: #666;
+        --inverse: #000;
+        color-scheme: dark;
+      }
+      :root[data-theme="light"] {
+        --base: #fff;
+        --surface-2: #e9e9ec;
+        --line-3: #cdcdd3;
+        --ink: #0a0a0a;
+        --muted: #52525b;
+        --faint: #71717a;
+        --inverse: #fff;
+        color-scheme: light;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0; min-height: 100dvh; display: grid; place-items: center;
+        background: var(--base); color: var(--ink); text-align: center; padding: 24px;
+        font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+      }
+      .mark {
+        width: 48px; height: 48px; margin: 0 auto 20px; display: grid; place-items: center;
+        border: 1px solid var(--line-3); background: var(--surface-2); border-radius: 12px;
+        color: var(--ink);
+      }
+      .code {
+        margin: 0 0 10px; font-family: ui-monospace, monospace; font-size: 12px;
+        letter-spacing: 0.18em; text-transform: uppercase; color: var(--faint);
+      }
+      h1 { margin: 0; font-size: clamp(28px, 6vw, 44px); letter-spacing: -0.03em; }
+      p { margin: 14px 0 28px; color: var(--muted); line-height: 1.6; }
+      a {
+        display: inline-flex; align-items: center; justify-content: center; height: 44px;
+        padding: 0 20px; border-radius: 12px; background: var(--ink); color: var(--inverse);
+        font-weight: 600; text-decoration: none;
+      }
+      a:hover { opacity: 0.85; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div class="mark">
+        <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M6 5v9a3 3 0 0 0 3 3h9" />
+          <path d="M14 5l4 4-4 4" />
+        </svg>
+      </div>
+      <p class="code">Error 404</p>
+      <h1>Halaman tidak ditemukan</h1>
+      <p>Tautannya mungkin salah atau sudah dipindahkan.<br />Kembali ke PluckDL untuk mengunduh video dan foto.</p>
+      <a href="/">Kembali ke PluckDL</a>
+    </main>
+  </body>
+</html>

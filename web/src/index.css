@@ -1,0 +1,209 @@
+@import "tailwindcss";
+@import "@fontsource-variable/geist";
+@import "@fontsource-variable/geist-mono";
+
+/* ── Design tokens — dark monochrome (gaya rdhx/Vercel) ───────────── */
+@theme {
+  --breakpoint-xs: 22rem;
+
+  --font-sans: "Geist Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "Geist Mono Variable", ui-monospace, SFMono-Regular, monospace;
+
+  /* Permukaan */
+  --color-base: #000000;
+  --color-surface: #0a0a0a;
+  --color-surface-2: #121212;
+  --color-surface-3: #1a1a1a;
+  --color-elevated: #242424;
+
+  /* Garis */
+  --color-line: #1a1a1a;
+  --color-line-2: #262626;
+  --color-line-3: #383838;
+  --color-focus: #737373;
+
+  /* Teks */
+  --color-ink: #ffffff;
+  --color-muted: #a3a3a3;
+  --color-faint: #666666;
+  --color-inverse: #000000;
+
+  /* Status */
+  --color-success: #34d399;
+  --color-warning: #fbbf24;
+  --color-danger: #ef4444;
+
+  --radius-lg: 0.5rem;
+  --radius-xl: 0.75rem;
+  --radius-2xl: 1rem;
+}
+
+/* ── Mode terang — monokrom terang, token yang sama, nilai dibalik ── */
+:root[data-theme="light"] {
+  --color-base: #ffffff;
+  --color-surface: #fafafa;
+  --color-surface-2: #f4f4f5;
+  --color-surface-3: #e9e9ec;
+  --color-elevated: #dedee3;
+
+  --color-line: #ececee;
+  --color-line-2: #e0e0e4;
+  --color-line-3: #cdcdd3;
+  --color-focus: #71717a;
+
+  --color-ink: #0a0a0a;
+  --color-muted: #52525b;
+  --color-faint: #71717a;
+  --color-inverse: #ffffff;
+
+  --color-success: #047857;
+  --color-warning: #b45309;
+  --color-danger: #b91c1c;
+
+  color-scheme: light;
+}
+
+/* Transisi tema: snapshot lama diam, snapshot baru dibuka sebagai lingkaran
+   dari titik klik tombol (lihat ThemeProvider). */
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation: none;
+  mix-blend-mode: normal;
+}
+::view-transition-old(root) {
+  z-index: 1;
+}
+::view-transition-new(root) {
+  z-index: 2;
+}
+
+@layer base {
+  html {
+    scroll-behavior: smooth;
+    -webkit-text-size-adjust: 100%;
+    background: var(--color-base);
+    min-width: 320px;
+    color-scheme: dark;
+    scrollbar-color: var(--color-line-3) var(--color-surface);
+  }
+  body {
+    background-color: var(--color-base);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    min-height: 100vh;
+    font-synthesis: none;
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+  ::selection {
+    color: var(--color-inverse);
+    background: var(--color-ink);
+  }
+  :focus-visible {
+    outline: 1.5px solid var(--color-focus);
+    outline-offset: 2px;
+    border-radius: 4px;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    html {
+      scroll-behavior: auto;
+    }
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+}
+
+@layer utilities {
+  /* Container standar halaman (max-w-6xl + padding responsif). */
+  .shell {
+    width: 100%;
+    max-width: 72rem;
+    margin-inline: auto;
+    padding-inline: 20px;
+  }
+  @media (min-width: 640px) {
+    .shell {
+      padding-inline: 32px;
+    }
+  }
+
+  /* Label mono uppercase dengan dua garis kecil di kiri-kanan. */
+  .eyebrow {
+    display: inline-flex;
+    align-items: center;
+    gap: 1rem;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--color-faint);
+  }
+  .eyebrow::before,
+  .eyebrow::after {
+    content: "";
+    width: 8px;
+    height: 3px;
+    background: var(--color-ink);
+    flex-shrink: 0;
+  }
+
+  .band {
+    border-top: 1px solid var(--color-line);
+  }
+
+  /* Masuk halaman: fade + naik 4px, cepat. */
+  .page-enter {
+    animation: 0.18s ease-out both page-enter;
+  }
+
+  .pulse-dot {
+    animation: 1.6s ease-in-out infinite pulse-dot;
+  }
+
+  /* Strip teks berjalan (marquee). Track digandakan 2x -> translate -50%. */
+  .marquee {
+    overflow: hidden;
+    -webkit-mask-image: linear-gradient(to right, transparent, #000 8%, #000 92%, transparent);
+    mask-image: linear-gradient(to right, transparent, #000 8%, #000 92%, transparent);
+  }
+  .marquee-track {
+    display: inline-flex;
+    white-space: nowrap;
+    animation: 26s linear infinite marquee;
+  }
+  .marquee:hover .marquee-track {
+    animation-play-state: paused;
+  }
+
+  @keyframes page-enter {
+    from {
+      opacity: 0;
+      transform: translateY(4px);
+    }
+  }
+  @keyframes pulse-dot {
+    0%,
+    100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.35;
+    }
+  }
+  @keyframes marquee {
+    to {
+      transform: translateX(-50%);
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .marquee-track {
+      animation: none;
+    }
+  }
+}
