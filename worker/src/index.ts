@@ -107,6 +107,43 @@ function isApiPath(path: string): boolean {
   return path === '/api' || path.startsWith('/api/')
 }
 
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+}
+
+/** Error unduhan: browser yang menavigasi ke /api/dl jangan diberi JSON mentah. */
+function downloadError(
+  req: Request,
+  message: string,
+  hint: string,
+  code: string,
+  status = 502,
+): Response {
+  const accept = req.headers.get('accept') ?? ''
+  const isNavigation =
+    req.headers.get('sec-fetch-mode') === 'navigate' || accept.includes('text/html')
+  if (!isNavigation) return json({ error: message, hint, code }, status)
+  const html =
+    '<!doctype html><html lang="id"><head><meta charset="utf-8">' +
+    '<meta name="viewport" content="width=device-width,initial-scale=1">' +
+    `<title>Unduhan gagal — PluckDL</title></head>` +
+    '<body style="margin:0;min-height:100vh;display:grid;place-items:center;background:#0a0a0a;color:#f5f5f5;font-family:system-ui,sans-serif">' +
+    '<main style="max-width:34rem;padding:2rem;text-align:center">' +
+    '<h1 style="font-size:1.35rem;margin:0 0 .75rem">Unduhan gagal</h1>' +
+    `<p style="color:#b5b5b5;line-height:1.6;margin:0 0 .5rem">${escapeHtml(message)}</p>` +
+    (hint ? `<p style="color:#8a8a8a;line-height:1.6;margin:0 0 1.25rem">${escapeHtml(hint)}</p>` : '') +
+    '<a href="/" style="display:inline-block;padding:.65rem 1rem;border-radius:.5rem;background:#f5f5f5;color:#0a0a0a;text-decoration:none;font-weight:600">Kembali ke PluckDL</a>' +
+    '</main></body></html>'
+  return new Response(html, {
+    status,
+    headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'private, no-store' },
+  })
+}
+
 /** Terapkan security header + CORS (kalau diizinkan) ke respons apa pun. */
 function finalize(req: Request, res: Response): Response {
   const headers = new Headers(res.headers)
@@ -149,21 +186,15 @@ function rateLimit(req: Request, kind: string, max: number): Response | null {
   if (hits.length >= max) {
     rateBuckets.set(key, hits)
     const retry = Math.max(1, Math.ceil((RATE_WINDOW_MS - (now - hits[0])) / 1000))
-    return new Response(
-      JSON.stringify({
-        error: 'Terlalu banyak permintaan.',
-        hint: `Coba lagi dalam ${retry} detik.`,
-        code: 'rate_limited',
-      }),
-      {
-        status: 429,
-        headers: {
-          'content-type': 'application/json; charset=utf-8',
-          'cache-control': 'private, no-store',
-          'retry-after': String(retry),
-        },
-      },
+    const res = downloadError(
+      req,
+      'Terlalu banyak permintaan.',
+      `Coba lagi dalam ${retry} detik.`,
+      'rate_limited',
+      429,
     )
+    res.headers.set('retry-after', String(retry))
+    return res
   }
   hits.push(now)
   rateBuckets.set(key, hits)
@@ -183,6 +214,13 @@ function rateLimitResolve(req: Request): Response | null {
 /** Content-type yang menandakan upstream mengirim halaman web, bukan berkas media. */
 function isHtmlContentType(ct: string): boolean {
   return ct.includes('text/html') || ct.includes('application/xhtml')
+}
+
+/** Respons JSON/teks dari CDN hampir selalu pesan error (token kedaluwarsa,
+ *  rate limit), bukan media. Jangan pernah disimpan sebagai .mp4/.jpg. */
+function isNonMediaContentType(ct: string): boolean {
+  const value = ct.toLowerCase()
+  return isHtmlContentType(value) || value.includes('application/json') || value.startsWith('text/')
 }
 
 function hostMatches(url: string, hosts: string[]): boolean {
@@ -297,8 +335,12 @@ async function resolveTiktok(rawUrl: string): Promise<ResolvedMedia> {
     formats.push({ id: 'nowm', label: 'Video (no watermark)', ext: 'mp4', kind: 'video', url: proxyUrl(data.downloadUrl, 'mp4', title, postId), size: null, note: '' })
   }
   if (data.hdDownloadUrl) {
-    // /api/hd butuh token X-Verify baru; tunda sampai pengguna memilih format hd.
-    formats.push({ id: 'hd', label: 'Video resolusi tertinggi', ext: 'mp4', kind: 'video', url: `/api/hdresolve?u=${encodeURIComponent(target)}&f=${encodeURIComponent(title)}&p=${encodeURIComponent(postId)}`, size: null, note: 'ukuran file bisa lebih kecil' })
+    // Resolve token HD sekarang, bukan saat link diklik: kalau gagal, link
+    // dibuang supaya pengguna tidak mendarat di halaman error JSON.
+    const hdTarget = await hdUrl(data, 3).catch(() => null)
+    if (hdTarget) {
+      formats.push({ id: 'hd', label: 'Video resolusi tertinggi', ext: 'mp4', kind: 'video', url: proxyUrl(hdTarget, 'mp4', title, postId), size: null, note: 'ukuran file bisa lebih kecil' })
+    }
   }
   if (!formats.length) {
     // Snaptik video-only; coba tikwm (bisa mengembalikan images ATAU video).
@@ -729,11 +771,21 @@ async function handleResolve(req: Request): Promise<Response> {
   }
 }
 
-async function handleHdResolve(src: string, title: string, postId = ''): Promise<Response> {
-  assertPublicHttp(src)
+async function handleHdResolve(req: Request, src: string, title: string, postId = ''): Promise<Response> {
+  try {
+    assertPublicHttp(src)
+  } catch (err) {
+    if (err instanceof ApiFail) {
+      return downloadError(req, err.message, err.hint, err.code, err.status)
+    }
+    throw err
+  }
   if (!hostMatches(src, TIKTOK_HOSTS)) {
-    return json(
-      { error: 'URL tidak diizinkan.', hint: 'Hanya tautan TikTok yang bisa di-resolve di sini.', code: 'unsafe_url' },
+    return downloadError(
+      req,
+      'URL tidak diizinkan.',
+      'Hanya tautan TikTok yang bisa di-resolve di sini.',
+      'unsafe_url',
       400,
     )
   }
@@ -741,7 +793,13 @@ async function handleHdResolve(src: string, title: string, postId = ''): Promise
     const data = await extract(src, 6)
     const target = await hdUrl(data)
     if (!target) {
-      return json({ error: 'Versi resolusi tertinggi tidak bisa diambil untuk video ini.', hint: 'Coba pilih "Video (no watermark)"; isinya biasanya sama.', code: 'hd_failed' }, 400)
+      return downloadError(
+        req,
+        'Versi resolusi tertinggi tidak bisa diambil untuk video ini.',
+        'Coba pilih "Video (no watermark)"; isinya biasanya sama.',
+        'hd_failed',
+        400,
+      )
     }
     // Relatif ke Worker ini (BUKAN Response.redirect, yang menyalin URL absolut
     // dan melewati proxy — CDN TikTok menolak hotlink tanpa referer yang benar).
@@ -754,9 +812,17 @@ async function handleHdResolve(src: string, title: string, postId = ''): Promise
       },
     })
   } catch {
-    return json({ error: 'Versi resolusi tertinggi tidak bisa diambil untuk video ini.', hint: 'Coba pilih "Video (no watermark)".', code: 'hd_failed' }, 400)
+    return downloadError(
+      req,
+      'Versi resolusi tertinggi tidak bisa diambil untuk video ini.',
+      'Coba pilih "Video (no watermark)".',
+      'hd_failed',
+      400,
+    )
   }
 }
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
 async function fetchMedia(url: string, range?: string, timeoutMs?: number): Promise<Response> {
   const headers: Record<string, string> = { 'User-Agent': UA_BROWSER }
@@ -778,33 +844,66 @@ async function handleDownload(req: Request): Promise<Response> {
   const params = new URL(req.url).searchParams
   const src = params.get('u') ?? ''
   if (!src) {
-    return json({ error: 'Parameter u wajib.', hint: 'Sertakan URL media di parameter u.', code: 'bad_request' }, 400)
+    return downloadError(req, 'Parameter u wajib.', 'Sertakan URL media di parameter u.', 'bad_request', 400)
   }
-  assertPublicHttp(src)
+  try {
+    assertPublicHttp(src)
+  } catch (err) {
+    if (err instanceof ApiFail) {
+      return downloadError(req, err.message, err.hint, err.code, err.status)
+    }
+    throw err
+  }
   // Hanya izinkan host CDN yang relevan, bukan sembarang situs.
   if (!hostMatches(src, MEDIA_HOSTS)) {
-    return json(
-      { error: 'Host unduhan tidak diizinkan.', hint: 'Hanya CDN media TikTok, Threads, atau X yang bisa dipakai.', code: 'unsafe_url' },
+    return downloadError(
+      req,
+      'Host unduhan tidak diizinkan.',
+      'Hanya CDN media TikTok, Threads, atau X yang bisa dipakai.',
+      'unsafe_url',
       400,
     )
   }
 
   const range = req.headers.get('range') ?? undefined
-  let upstream: Response
-  try {
-    upstream = await fetchMedia(src, range)
-  } catch {
-    return json({ error: 'Gagal mengunduh.', hint: 'Koneksi ke server penyimpanan terputus. Coba lagi.', code: 'upstream' }, 502)
+  let upstream: Response | null = null
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const res = await fetchMedia(src, range)
+      upstream = res
+      if (res.ok || res.status === 206 || (res.status < 500 && res.status !== 429)) break
+    } catch {
+      /* coba lagi */
+    }
+    if (attempt < 2) await sleep(250 * (attempt + 1))
+  }
+  if (!upstream) {
+    return downloadError(
+      req,
+      'Gagal mengunduh.',
+      'Koneksi ke server penyimpanan terputus. Coba lagi.',
+      'upstream',
+      502,
+    )
   }
   if (!upstream.ok && upstream.status !== 206) {
-    return json({ error: 'Gagal mengunduh.', hint: 'Koneksi ke server penyimpanan terputus. Coba lagi.', code: 'upstream' }, 502)
+    return downloadError(
+      req,
+      'Gagal mengunduh.',
+      'Server penyimpanan sedang bermasalah. Coba lagi sebentar lagi.',
+      'upstream',
+      502,
+    )
   }
   const contentType = upstream.headers.get('content-type') ?? ''
-  // CDN Threads/Instagram membalas HTML halaman login saat sesi/URL ditolak.
-  // Menyimpannya sebagai .mp4/.htm menyesatkan pengguna — tolak dengan pesan jelas.
-  if (isHtmlContentType(contentType)) {
-    return json(
-      { error: 'Server media menolak permintaan ini.', hint: 'Tautan media mungkin sudah kedaluwarsa. Tekan "Periksa tautan" lagi untuk URL baru.', code: 'upstream' },
+  // CDN membalas HTML/JSON saat sesi atau token ditolak. Jangan pernah simpan
+  // respons itu sebagai .mp4/.jpg — pengguna akan mendapatkan file JSON rusak.
+  if (isNonMediaContentType(contentType)) {
+    return downloadError(
+      req,
+      'Server media menolak permintaan ini.',
+      'Tautan media mungkin sudah kedaluwarsa. Tekan "Periksa tautan" lagi untuk URL baru.',
+      'upstream',
       502,
     )
   }
@@ -842,17 +941,30 @@ async function handleZip(req: Request): Promise<Response> {
   const params = new URL(req.url).searchParams
   const urls = [...params.getAll('u')]
   if (!urls.length || urls.length > 30) {
-    return json(
-      { error: 'Jumlah gambar tidak valid.', hint: 'Sertakan 1–30 URL gambar di parameter u.', code: 'bad_request' },
+    return downloadError(
+      req,
+      'Jumlah gambar tidak valid.',
+      'Sertakan 1–30 URL gambar di parameter u.',
+      'bad_request',
       400,
     )
   }
   for (const u of urls) {
-    assertPublicHttp(u)
+    try {
+      assertPublicHttp(u)
+    } catch (err) {
+      if (err instanceof ApiFail) {
+        return downloadError(req, err.message, err.hint, err.code, err.status)
+      }
+      throw err
+    }
     // Allowlist yang sama dengan /api/dl — /api/zip tidak boleh jadi proxy bebas.
     if (!hostMatches(u, MEDIA_HOSTS)) {
-      return json(
-        { error: 'Host gambar tidak diizinkan.', hint: 'Hanya CDN media TikTok, Threads, atau X yang bisa dipakai.', code: 'unsafe_url' },
+      return downloadError(
+        req,
+        'Host gambar tidak diizinkan.',
+        'Hanya CDN media TikTok, Threads, atau X yang bisa dipakai.',
+        'unsafe_url',
         400,
       )
     }
@@ -866,27 +978,36 @@ async function handleZip(req: Request): Promise<Response> {
     try {
       const res = await fetchMedia(u, undefined, 20_000)
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      // Halaman login/kedaluwarsa jangan ikut dimasukkan sebagai gambar.
-      if (isHtmlContentType(res.headers.get('content-type') ?? '')) throw new Error('html')
+      // Halaman login/error JSON jangan ikut dimasukkan sebagai gambar.
+      if (isNonMediaContentType(res.headers.get('content-type') ?? '')) throw new Error('non-media')
       const declared = Number(res.headers.get('content-length') ?? '')
       if (Number.isFinite(declared) && declared > MAX_ZIP_ITEM_BYTES) {
-        return json(
-          { error: `Gambar ${i} terlalu besar.`, hint: 'Ukuran maksimal per gambar 10 MB.', code: 'too_large' },
+        return downloadError(
+          req,
+          `Gambar ${i} terlalu besar.`,
+          'Ukuran maksimal per gambar 10 MB.',
+          'too_large',
           413,
         )
       }
       const buf = new Uint8Array(await res.arrayBuffer())
       if (!buf.length) throw new Error('empty')
       if (buf.length > MAX_ZIP_ITEM_BYTES) {
-        return json(
-          { error: `Gambar ${i} terlalu besar.`, hint: 'Ukuran maksimal per gambar 10 MB.', code: 'too_large' },
+        return downloadError(
+          req,
+          `Gambar ${i} terlalu besar.`,
+          'Ukuran maksimal per gambar 10 MB.',
+          'too_large',
           413,
         )
       }
       totalBytes += buf.length
       if (totalBytes > MAX_ZIP_TOTAL_BYTES) {
-        return json(
-          { error: 'Total gambar terlalu besar.', hint: 'Ukuran maksimal arsip 40 MB.', code: 'too_large' },
+        return downloadError(
+          req,
+          'Total gambar terlalu besar.',
+          'Ukuran maksimal arsip 40 MB.',
+          'too_large',
           413,
         )
       }
@@ -894,7 +1015,13 @@ async function handleZip(req: Request): Promise<Response> {
       const ext = guessed === 'bin' ? 'jpg' : guessed
       items.push({ name: `${String(i).padStart(2, '0')}.${ext}`, data: buf })
     } catch {
-      return json({ error: `Gagal mengunduh gambar ${i}.`, hint: 'Coba lagi sebentar lagi.', code: 'upstream' }, 502)
+      return downloadError(
+        req,
+        `Gagal mengunduh gambar ${i}.`,
+        'Coba lagi sebentar lagi.',
+        'upstream',
+        502,
+      )
     }
   }
   const zip = makeZip(items)
@@ -980,6 +1107,7 @@ async function route(req: Request, env: { ASSETS: Fetcher }): Promise<Response> 
   }
   if (path === '/api/hdresolve' && req.method === 'GET') {
     return handleHdResolve(
+      req,
       url.searchParams.get('u') ?? '',
       url.searchParams.get('f') ?? '',
       url.searchParams.get('p') ?? '',
