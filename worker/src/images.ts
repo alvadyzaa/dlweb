@@ -29,6 +29,8 @@ export interface ImageItem {
   width: number
   height: number
   isVideo: boolean
+  /** URL video untuk item carousel (bila ada). */
+  videoUrl?: string | null
 }
 
 export interface ImagePost {
@@ -53,7 +55,7 @@ export async function tiktokPhoto(url: string): Promise<ImagePost> {
     })
     body = await res.json()
   } catch {
-    throw new ImageError('Post ini tidak bisa dibaca.', 'Coba lagi sebentar lagi.')
+    throw new ImageError('Post ini tidak bisa dibaca.', 'Coba lagi sebentar lagi.', 'network')
   }
   if (body?.code !== 0) {
     throw new ImageError(
@@ -275,6 +277,7 @@ export async function threadsPost(url: string): Promise<ImagePost & { videoUrl: 
       width: best.width,
       height: best.height,
       isVideo: Boolean(entry.video_versions?.length),
+      videoUrl: entry.video_versions?.length ? bestVideo(entry) : null,
     })
   }
 

@@ -10,7 +10,12 @@ import SiteFooter from './components/SiteFooter'
 /** Satu halaman landing: hero -> panel unduh -> fitur -> cara pakai -> FAQ -> footer. */
 export default function App() {
   useEffect(() => {
-    const id = decodeURIComponent(window.location.hash.slice(1))
+    let id = ''
+    try {
+      id = decodeURIComponent(window.location.hash.slice(1))
+    } catch {
+      id = window.location.hash.slice(1)
+    }
     if (!id) return
     const scroll = () => document.getElementById(id)?.scrollIntoView({ block: 'start' })
     requestAnimationFrame(() => requestAnimationFrame(scroll))

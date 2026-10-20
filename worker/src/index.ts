@@ -33,6 +33,9 @@ const MEDIA_HOSTS = [
   'twimg.com',
 ]
 
+/** Ekstensi yang boleh dipasang lewat parameter `e` dari resolver. */
+const HINT_EXTS = new Set(['mp4', 'mov', 'webm', 'm4a', 'mp3', 'jpg', 'jpeg', 'png', 'webp'])
+
 /** Origin yang memang memakai API ini dari browser. Same-origin selalu lolos. */
 const ALLOWED_ORIGINS = new Set([
   'https://pluck.alva.web.id',
@@ -127,6 +130,8 @@ function normalizeUrl(raw: string): string {
 
 const RATE_WINDOW_MS = 60_000
 const RATE_MAX_RESOLVE = 15
+const RATE_MAX_ZIP = 10
+const RATE_MAX_DOWNLOAD = 120
 const rateBuckets = new Map<string, number[]>()
 
 function clientIp(req: Request): string {
@@ -137,11 +142,11 @@ function clientIp(req: Request): string {
   )
 }
 
-function rateLimitResolve(req: Request): Response | null {
-  const key = clientIp(req)
+function rateLimit(req: Request, kind: string, max: number): Response | null {
+  const key = `${kind}:${clientIp(req)}`
   const now = Date.now()
   const hits = (rateBuckets.get(key) ?? []).filter((t) => now - t < RATE_WINDOW_MS)
-  if (hits.length >= RATE_MAX_RESOLVE) {
+  if (hits.length >= max) {
     rateBuckets.set(key, hits)
     const retry = Math.max(1, Math.ceil((RATE_WINDOW_MS - (now - hits[0])) / 1000))
     return new Response(
@@ -164,11 +169,15 @@ function rateLimitResolve(req: Request): Response | null {
   rateBuckets.set(key, hits)
   // Jaga ukuran map di isolate yang hidup lama.
   if (rateBuckets.size > 5000) {
-    for (const [ip, times] of rateBuckets) {
-      if (!times.some((t) => now - t < RATE_WINDOW_MS)) rateBuckets.delete(ip)
+    for (const [bucket, times] of rateBuckets) {
+      if (!times.some((t) => now - t < RATE_WINDOW_MS)) rateBuckets.delete(bucket)
     }
   }
   return null
+}
+
+function rateLimitResolve(req: Request): Response | null {
+  return rateLimit(req, 'resolve', RATE_MAX_RESOLVE)
 }
 
 /** Content-type yang menandakan upstream mengirim halaman web, bukan berkas media. */
@@ -195,7 +204,8 @@ function looksLikeHttpUrl(raw: string): boolean {
   }
 }
 
-/** SSRF guard ringan: hanya http(s), blokir host internal/metadata. */
+/** SSRF guard ringan: hanya http(s), blokir host internal/metadata
+ *  (termasuk IPv6 dan bentuk IPv4 yang sudah dinormalisasi URL parser). */
 function assertPublicHttp(raw: string): void {
   let u: URL
   try {
@@ -206,16 +216,24 @@ function assertPublicHttp(raw: string): void {
   if (u.protocol !== 'http:' && u.protocol !== 'https:') {
     throw new ApiFail('URL tidak valid.', 'Hanya tautan http:// atau https:// yang didukung.', 'invalid_url')
   }
-  const host = u.hostname.toLowerCase()
+  const host = u.hostname.toLowerCase().replace(/\.$/, '')
+  const ipv6 = host.startsWith('[') ? host.slice(1, -1) : ''
   if (
     host === 'localhost' ||
+    host === '0.0.0.0' ||
     host.endsWith('.local') ||
     host.endsWith('.internal') ||
     /^127\./.test(host) ||
     /^10\./.test(host) ||
     /^192\.168\./.test(host) ||
     /^169\.254\./.test(host) ||
-    /^172\.(1[6-9]|2\d|3[01])\./.test(host)
+    /^172\.(1[6-9]|2\d|3[01])\./.test(host) ||
+    // IPv6 loopback/unspecified/link-local/ULA, termasuk IPv4-mapped.
+    ipv6 === '::1' ||
+    ipv6 === '::' ||
+    ipv6.startsWith('::ffff:') ||
+    /^f[cd]/.test(ipv6) ||
+    /^fe[89ab]/.test(ipv6)
   ) {
     throw new ApiFail(
       'URL tidak diizinkan.',
@@ -260,7 +278,12 @@ async function resolveTiktok(rawUrl: string): Promise<ResolvedMedia> {
     if (err instanceof PermanentError) {
       throw new ApiFail('Video ini tidak tersedia.', 'Post-nya mungkin sudah dihapus atau dibuat privat oleh pemiliknya.', 'not_found')
     }
-    throw new ApiFail('Video ini gagal diambil.', 'Kemungkinan video privat, atau server sedang ditolak platform. Coba lagi sebentar lagi.')
+    throw new ApiFail(
+      'Video ini gagal diambil.',
+      'Kemungkinan video privat, atau server sedang ditolak platform. Coba lagi sebentar lagi.',
+      'network',
+      503,
+    )
   }
 
   const author = data.author?.username ?? ''
@@ -297,7 +320,10 @@ async function resolveTiktokPhoto(target: string): Promise<ResolvedMedia> {
   try {
     post = await tiktokPhoto(target)
   } catch (err) {
-    if (err instanceof ImageError) throw new ApiFail(err.message, err.hint, err.code)
+    if (err instanceof ImageError) {
+      const status = err.code === 'upstream' || err.code === 'network' ? 503 : 400
+      throw new ApiFail(err.message, err.hint, err.code, status)
+    }
     throw err
   }
   const postId = post.id || postIdFromUrl(target)
@@ -349,7 +375,21 @@ async function resolveThreads(rawUrl: string): Promise<ResolvedMedia> {
     formats.push({ id: 'video', label: 'Video (audio+video)', ext: 'mp4', kind: 'video', url: proxyUrl(post.videoUrl, 'mp4', post.title, post.id), size: null, note: '' })
   }
   for (const item of post.items) {
-    if (item.isVideo) continue // video sudah ditangani lewat videoUrl
+    if (item.isVideo) {
+      // Carousel video: tiap entry punya video_versions sendiri.
+      if (item.videoUrl && (post.items.length > 1 || !post.videoUrl)) {
+        formats.push({
+          id: post.items.length > 1 ? `video${item.index}` : 'video',
+          label: `Video ${item.index}`,
+          ext: 'mp4',
+          kind: 'video',
+          url: proxyUrl(item.videoUrl, 'mp4', post.title, post.id),
+          size: null,
+          note: '',
+        })
+      }
+      continue
+    }
     formats.push({
       id: `img${item.index}`,
       label: `Gambar ${item.index}` + (item.width ? ` · ${item.width}×${item.height}` : ''),
@@ -418,16 +458,41 @@ async function resolveTwitter(rawUrl: string): Promise<ResolvedMedia> {
       headers: { 'User-Agent': UA_BROWSER, Accept: 'application/json' },
     })
     httpStatus = res.status
-    if (res.ok || res.status === 404) data = await res.json()
-  } catch {
-    throw new ApiFail('Post X ini gagal dibaca.', 'Coba lagi sebentar lagi.', 'network')
+    if (res.ok || res.status === 404) {
+      try {
+        data = await res.json()
+      } catch {
+        if (res.ok) {
+          throw new ApiFail('Post X ini gagal dibaca.', 'Coba lagi sebentar lagi.', 'network', 503)
+        }
+      }
+    }
+  } catch (err) {
+    if (err instanceof ApiFail) throw err
+    throw new ApiFail('Post X ini gagal dibaca.', 'Coba lagi sebentar lagi.', 'network', 503)
   }
-  if (httpStatus === 0 || httpStatus >= 500) {
-    throw new ApiFail('Post X ini gagal dibaca.', 'Coba lagi sebentar lagi.', 'network')
+  if (httpStatus === 429) {
+    throw new ApiFail(
+      'Server X sedang membatasi permintaan.',
+      'Coba lagi beberapa saat lagi.',
+      'rate_limited',
+      429,
+    )
+  }
+  if (httpStatus === 0 || httpStatus === 401 || httpStatus === 403 || httpStatus >= 500) {
+    throw new ApiFail('Post X ini gagal dibaca.', 'Coba lagi sebentar lagi.', 'network', 503)
+  }
+
+  if (httpStatus === 404) {
+    throw new ApiFail(
+      'Post X ini tidak bisa dibuka.',
+      'Kemungkinan sudah dihapus, akunnya privat, atau tautannya bukan post.',
+      'not_found',
+    )
   }
 
   const tweet = data?.tweet
-  if (httpStatus === 404 || !tweet || (typeof data?.code === 'number' && data.code !== 200)) {
+  if (!tweet || (typeof data?.code === 'number' && data.code !== 200)) {
     throw new ApiFail(
       'Post X ini tidak bisa dibuka.',
       'Kemungkinan sudah dihapus, akunnya privat, atau tautannya bukan post.',
@@ -476,13 +541,14 @@ async function resolveTwitter(rawUrl: string): Promise<ResolvedMedia> {
     })
   })
 
-  if (photos.length > 1) {
+  const photoUrls = photos.map((p: any) => p?.url).filter((u: unknown): u is string => typeof u === 'string')
+  if (photoUrls.length > 1) {
     formats.push({
       id: 'zip',
-      label: `Semua gambar (.zip · ${photos.length} file)`,
+      label: `Semua gambar (.zip · ${photoUrls.length} file)`,
       ext: 'zip',
       kind: 'image',
-      url: zipUrl(photos.map((p) => p.url), title, post.id),
+      url: zipUrl(photoUrls, title, post.id),
       size: null,
       note: 'satu file',
     })
@@ -692,16 +758,23 @@ async function handleHdResolve(src: string, title: string, postId = ''): Promise
   }
 }
 
-async function fetchMedia(url: string, range?: string): Promise<Response> {
+async function fetchMedia(url: string, range?: string, timeoutMs?: number): Promise<Response> {
   const headers: Record<string, string> = { 'User-Agent': UA_BROWSER }
   // CDN TikTok butuh Referer snaptik; CDN X (twimg) justru menolak Referer
   // pihak ketiga dengan 403, jadi hanya kirim Referer untuk non-twimg.
   if (!hostMatches(url, ['twimg.com'])) headers.Referer = 'https://snaptik.app/'
   if (range) headers.Range = range
-  return fetch(url, { headers, redirect: 'follow' })
+  return fetch(url, {
+    headers,
+    redirect: 'follow',
+    signal: timeoutMs ? AbortSignal.timeout(timeoutMs) : undefined,
+  })
 }
 
 async function handleDownload(req: Request): Promise<Response> {
+  const limited = rateLimit(req, 'download', RATE_MAX_DOWNLOAD)
+  if (limited) return limited
+
   const params = new URL(req.url).searchParams
   const src = params.get('u') ?? ''
   if (!src) {
@@ -739,7 +812,8 @@ async function handleDownload(req: Request): Promise<Response> {
   // Ekstensi dari content-type/URL; kalau generik, pakai petunjuk `e` dari resolver
   // (mis. CDN rapidcdn membalas application/octet-stream pada URL tanpa ekstensi).
   let ext = guessExt(src, contentType)
-  const hinted = (params.get('e') ?? '').replace(/[^A-Za-z0-9]/g, '').slice(0, 5).toLowerCase()
+  const hintedRaw = (params.get('e') ?? '').replace(/[^A-Za-z0-9]/g, '').slice(0, 5).toLowerCase()
+  const hinted = HINT_EXTS.has(hintedRaw) ? (hintedRaw === 'jpeg' ? 'jpg' : hintedRaw) : ''
   if (ext === 'bin' && hinted) ext = hinted
   const name = downloadName(params.get('f') ?? '', ext)
   const fallback = params.get('p') ?? safeName(src, '')
@@ -758,7 +832,13 @@ async function handleDownload(req: Request): Promise<Response> {
   return new Response(upstream.body, { status: upstream.status, headers })
 }
 
+const MAX_ZIP_ITEM_BYTES = 10 * 1024 * 1024
+const MAX_ZIP_TOTAL_BYTES = 40 * 1024 * 1024
+
 async function handleZip(req: Request): Promise<Response> {
+  const limited = rateLimit(req, 'zip', RATE_MAX_ZIP)
+  if (limited) return limited
+
   const params = new URL(req.url).searchParams
   const urls = [...params.getAll('u')]
   if (!urls.length || urls.length > 30) {
@@ -779,16 +859,37 @@ async function handleZip(req: Request): Promise<Response> {
   }
 
   const items: Array<{ name: string; data: Uint8Array }> = []
+  let totalBytes = 0
   let i = 0
   for (const u of urls) {
     i++
     try {
-      const res = await fetchMedia(u)
+      const res = await fetchMedia(u, undefined, 20_000)
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       // Halaman login/kedaluwarsa jangan ikut dimasukkan sebagai gambar.
       if (isHtmlContentType(res.headers.get('content-type') ?? '')) throw new Error('html')
+      const declared = Number(res.headers.get('content-length') ?? '')
+      if (Number.isFinite(declared) && declared > MAX_ZIP_ITEM_BYTES) {
+        return json(
+          { error: `Gambar ${i} terlalu besar.`, hint: 'Ukuran maksimal per gambar 10 MB.', code: 'too_large' },
+          413,
+        )
+      }
       const buf = new Uint8Array(await res.arrayBuffer())
       if (!buf.length) throw new Error('empty')
+      if (buf.length > MAX_ZIP_ITEM_BYTES) {
+        return json(
+          { error: `Gambar ${i} terlalu besar.`, hint: 'Ukuran maksimal per gambar 10 MB.', code: 'too_large' },
+          413,
+        )
+      }
+      totalBytes += buf.length
+      if (totalBytes > MAX_ZIP_TOTAL_BYTES) {
+        return json(
+          { error: 'Total gambar terlalu besar.', hint: 'Ukuran maksimal arsip 40 MB.', code: 'too_large' },
+          413,
+        )
+      }
       const guessed = guessExt(u, res.headers.get('content-type') ?? '')
       const ext = guessed === 'bin' ? 'jpg' : guessed
       items.push({ name: `${String(i).padStart(2, '0')}.${ext}`, data: buf })
