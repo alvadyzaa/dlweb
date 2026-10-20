@@ -81,23 +81,27 @@ export default function HeroSection() {
             {ACTIVE_PLATFORMS.map((p) => p.label).join(' · ')}
           </motion.p>
 
-          <h1 className="mt-6 max-w-4xl text-balance text-4xl font-semibold leading-[1.05] tracking-tighter sm:text-6xl lg:text-7xl">
+          <h1
+            aria-label={headlineLines.join(' ')}
+            className="mt-6 max-w-4xl text-balance text-4xl font-semibold leading-[1.05] tracking-tighter sm:text-6xl lg:text-7xl"
+          >
             {headline.map((words, li) => (
-              <span key={li} className="block">
+              <span key={li} className="block" aria-hidden="true">
                 {words.map((word, wi) => {
                   const i = offsets[li] + wi
                   return (
                     <motion.span
                       key={`${word}-${i}`}
-                      className="mr-[0.25em] inline-block last:mr-0"
+                      className="inline-block whitespace-pre"
                       initial={{ opacity: 0, y: 24, filter: 'blur(8px)' }}
                       animate={{ opacity: 1, y: 0, filter: 'blur(0px)' }}
                       transition={{ duration: 0.7, ease: EASE, delay: 0.1 + i * 0.08 }}
                     >
-                      {word}
+                      {wi < words.length - 1 ? `${word} ` : word}
                     </motion.span>
                   )
                 })}
+                {li < headline.length - 1 ? ' ' : null}
               </span>
             ))}
           </h1>

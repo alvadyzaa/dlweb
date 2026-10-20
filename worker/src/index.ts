@@ -24,6 +24,25 @@ const TIKTOK_SHORT = ['vt.tiktok.com', 'vm.tiktok.com', 't.tiktok.com', 'vt.tikt
 const THREADS_HOSTS = ['threads.com', 'threads.net']
 const TWITTER_HOSTS = ['x.com', 'twitter.com']
 
+/** Host CDN yang boleh diproksikan lewat /api/dl dan /api/zip. Tanpa daftar ini
+ *  Worker menjadi proxy fetch gratis untuk URL publik mana pun. */
+const MEDIA_HOSTS = [
+  'tiktokcdn.com', 'tiktokcdn-us.com', 'tiktokcdn-eu.com', 'tiktokv.com',
+  'byteoversea.com', 'ibyteimg.com', 'tikwm.com', 'snaptik.app', 'rapidcdn.app',
+  'cdninstagram.com', 'fbcdn.net', 'threads.com', 'threads.net',
+  'twimg.com',
+]
+
+/** Origin yang memang memakai API ini dari browser. Same-origin selalu lolos. */
+const ALLOWED_ORIGINS = new Set([
+  'https://pluck.alva.web.id',
+  'https://www.pluck.alva.web.id',
+  'http://localhost:5173',
+  'http://127.0.0.1:5173',
+  'http://localhost:8787',
+  'http://127.0.0.1:8787',
+])
+
 /** API JSON tak resmi untuk X/Twitter: mengembalikan teks + media langsung
  *  dari video.twimg.com/pbs.twimg.com (jauh lebih stabil daripada scraping). */
 const FX_API = 'https://api.fxtwitter.com'
@@ -50,6 +69,107 @@ const json = (body: unknown, status = 200) =>
       'cache-control': 'private, no-store',
     },
   })
+
+/** Header keamanan untuk semua respons (API + halaman statis). */
+const SECURITY_HEADERS: Record<string, string> = {
+  'strict-transport-security': 'max-age=31536000; includeSubDomains',
+  'x-content-type-options': 'nosniff',
+  'x-frame-options': 'DENY',
+  'referrer-policy': 'strict-origin-when-cross-origin',
+  'permissions-policy': 'camera=(), microphone=(), geolocation=()',
+  'content-security-policy':
+    "default-src 'self'; script-src 'self' 'unsafe-inline'; " +
+    "style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; " +
+    "media-src 'self' https:; connect-src 'self'; font-src 'self' data:; " +
+    "object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'",
+}
+
+/** CORS hanya untuk origin sendiri. Request same-origin tidak butuh header ini. */
+function corsHeaders(req: Request): Record<string, string> | null {
+  const origin = req.headers.get('origin')
+  if (!origin) return null
+  let sameOrigin = false
+  try {
+    const o = new URL(origin)
+    const self = new URL(req.url)
+    sameOrigin = o.protocol === self.protocol && o.host === self.host
+  } catch {
+    /* Origin tidak valid */
+  }
+  if (!sameOrigin && !ALLOWED_ORIGINS.has(origin)) return null
+  return { 'access-control-allow-origin': origin, vary: 'Origin' }
+}
+
+function isApiPath(path: string): boolean {
+  return path === '/api' || path.startsWith('/api/')
+}
+
+/** Terapkan security header + CORS (kalau diizinkan) ke respons apa pun. */
+function finalize(req: Request, res: Response): Response {
+  const headers = new Headers(res.headers)
+  for (const [key, value] of Object.entries(SECURITY_HEADERS)) {
+    if (!headers.has(key)) headers.set(key, value)
+  }
+  if (isApiPath(new URL(req.url).pathname)) {
+    const cors = corsHeaders(req)
+    if (cors) {
+      for (const [key, value] of Object.entries(cors)) headers.set(key, value)
+    }
+  }
+  return new Response(res.body, { status: res.status, statusText: res.statusText, headers })
+}
+
+function normalizeUrl(raw: string): string {
+  return raw.trim().replace(/^https?:\/\//i, (scheme) => scheme.toLowerCase())
+}
+
+/* ----------------------------------------------------------- rate limiting */
+
+const RATE_WINDOW_MS = 60_000
+const RATE_MAX_RESOLVE = 15
+const rateBuckets = new Map<string, number[]>()
+
+function clientIp(req: Request): string {
+  return (
+    req.headers.get('cf-connecting-ip') ||
+    req.headers.get('x-forwarded-for')?.split(',')[0]?.trim() ||
+    'unknown'
+  )
+}
+
+function rateLimitResolve(req: Request): Response | null {
+  const key = clientIp(req)
+  const now = Date.now()
+  const hits = (rateBuckets.get(key) ?? []).filter((t) => now - t < RATE_WINDOW_MS)
+  if (hits.length >= RATE_MAX_RESOLVE) {
+    rateBuckets.set(key, hits)
+    const retry = Math.max(1, Math.ceil((RATE_WINDOW_MS - (now - hits[0])) / 1000))
+    return new Response(
+      JSON.stringify({
+        error: 'Terlalu banyak permintaan.',
+        hint: `Coba lagi dalam ${retry} detik.`,
+        code: 'rate_limited',
+      }),
+      {
+        status: 429,
+        headers: {
+          'content-type': 'application/json; charset=utf-8',
+          'cache-control': 'private, no-store',
+          'retry-after': String(retry),
+        },
+      },
+    )
+  }
+  hits.push(now)
+  rateBuckets.set(key, hits)
+  // Jaga ukuran map di isolate yang hidup lama.
+  if (rateBuckets.size > 5000) {
+    for (const [ip, times] of rateBuckets) {
+      if (!times.some((t) => now - t < RATE_WINDOW_MS)) rateBuckets.delete(ip)
+    }
+  }
+  return null
+}
 
 /** Content-type yang menandakan upstream mengirim halaman web, bukan berkas media. */
 function isHtmlContentType(ct: string): boolean {
@@ -81,10 +201,10 @@ function assertPublicHttp(raw: string): void {
   try {
     u = new URL(raw.trim())
   } catch {
-    throw new ApiFail('URL tidak valid.', '', 'invalid_url')
+    throw new ApiFail('URL tidak valid.', 'Tempel tautan lengkap yang diawali https://.', 'invalid_url')
   }
   if (u.protocol !== 'http:' && u.protocol !== 'https:') {
-    throw new ApiFail('URL tidak valid.', '', 'invalid_url')
+    throw new ApiFail('URL tidak valid.', 'Hanya tautan http:// atau https:// yang didukung.', 'invalid_url')
   }
   const host = u.hostname.toLowerCase()
   if (
@@ -97,11 +217,21 @@ function assertPublicHttp(raw: string): void {
     /^169\.254\./.test(host) ||
     /^172\.(1[6-9]|2\d|3[01])\./.test(host)
   ) {
-    throw new ApiFail('URL tidak diizinkan.', '', 'unsafe_url')
+    throw new ApiFail(
+      'URL tidak diizinkan.',
+      'Gunakan tautan publik dari TikTok, Threads, atau X — bukan alamat jaringan internal.',
+      'unsafe_url',
+    )
   }
 }
 
 /* --------------------------------------------------------------- resolver */
+
+/** ID post dari URL kanonik, dipakai sebagai nama file cadangan. */
+function postIdFromUrl(raw: string): string {
+  const m = /\/(?:video|photo)\/(\d+)/.exec(raw) || /\/status\/(\d+)/.exec(raw)
+  return m ? m[1] : ''
+}
 
 async function resolveTiktok(rawUrl: string): Promise<ResolvedMedia> {
   let target = rawUrl.trim()
@@ -134,17 +264,18 @@ async function resolveTiktok(rawUrl: string): Promise<ResolvedMedia> {
   }
 
   const author = data.author?.username ?? ''
+  const postId = String(data.id ?? '') || postIdFromUrl(target)
   let title = (data.title ?? '').trim()
   if (!title || title.startsWith('http://') || title.startsWith('https://')) {
     title = author ? `TikTok ${author}` : 'Video TikTok'
   }
   const formats: MediaFormat[] = []
   if (data.downloadUrl) {
-    formats.push({ id: 'nowm', label: 'Video (no watermark)', ext: 'mp4', kind: 'video', url: proxyUrl(data.downloadUrl, 'mp4', title), size: null, note: '' })
+    formats.push({ id: 'nowm', label: 'Video (no watermark)', ext: 'mp4', kind: 'video', url: proxyUrl(data.downloadUrl, 'mp4', title, postId), size: null, note: '' })
   }
   if (data.hdDownloadUrl) {
     // /api/hd butuh token X-Verify baru; tunda sampai pengguna memilih format hd.
-    formats.push({ id: 'hd', label: 'Video resolusi tertinggi', ext: 'mp4', kind: 'video', url: `/api/hdresolve?u=${encodeURIComponent(target)}&f=${encodeURIComponent(title)}`, size: null, note: 'ukuran file bisa lebih kecil' })
+    formats.push({ id: 'hd', label: 'Video resolusi tertinggi', ext: 'mp4', kind: 'video', url: `/api/hdresolve?u=${encodeURIComponent(target)}&f=${encodeURIComponent(title)}&p=${encodeURIComponent(postId)}`, size: null, note: 'ukuran file bisa lebih kecil' })
   }
   if (!formats.length) {
     // Snaptik video-only; coba tikwm (bisa mengembalikan images ATAU video).
@@ -169,15 +300,16 @@ async function resolveTiktokPhoto(target: string): Promise<ResolvedMedia> {
     if (err instanceof ImageError) throw new ApiFail(err.message, err.hint, err.code)
     throw err
   }
+  const postId = post.id || postIdFromUrl(target)
   const formats: MediaFormat[] = post.items.map((item) => ({
     id: `img${item.index}`,
     label: `Gambar ${item.index}`,
     ext: 'jpg',
     kind: 'image' as const,
-    url: proxyUrl(item.url, 'jpg', post.title),
+    url: proxyUrl(item.url, 'jpg', post.title, postId),
     size: null,
     note: '',
-    thumb: proxyUrl(item.url, 'jpg'),
+    thumb: proxyUrl(item.url, 'jpg', undefined, postId),
   }))
   if (formats.length > 1) {
     formats.push({
@@ -185,7 +317,7 @@ async function resolveTiktokPhoto(target: string): Promise<ResolvedMedia> {
       label: `Semua gambar (.zip · ${formats.length} file)`,
       ext: 'zip',
       kind: 'image',
-      url: zipUrl(post.items.map((i) => i.url), post.title),
+      url: zipUrl(post.items.map((i) => i.url), post.title, postId),
       size: null,
       note: 'satu file',
     })
@@ -195,7 +327,7 @@ async function resolveTiktokPhoto(target: string): Promise<ResolvedMedia> {
     title: post.title,
     author: post.author,
     thumbnail: post.thumbnail,
-    duration: null,
+    duration: post.duration,
     formats,
   }
 }
@@ -205,13 +337,16 @@ async function resolveThreads(rawUrl: string): Promise<ResolvedMedia> {
   try {
     post = await threadsPost(rawUrl.trim())
   } catch (err) {
-    if (err instanceof ImageError) throw new ApiFail(err.message, err.hint, err.code)
+    if (err instanceof ImageError) {
+      const status = err.code === 'upstream' || err.code === 'network' ? 503 : 400
+      throw new ApiFail(err.message, err.hint, err.code, status)
+    }
     throw err
   }
 
   const formats: MediaFormat[] = []
   if (post.videoUrl) {
-    formats.push({ id: 'video', label: 'Video (audio+video)', ext: 'mp4', kind: 'video', url: proxyUrl(post.videoUrl, 'mp4', post.title), size: null, note: '' })
+    formats.push({ id: 'video', label: 'Video (audio+video)', ext: 'mp4', kind: 'video', url: proxyUrl(post.videoUrl, 'mp4', post.title, post.id), size: null, note: '' })
   }
   for (const item of post.items) {
     if (item.isVideo) continue // video sudah ditangani lewat videoUrl
@@ -220,10 +355,10 @@ async function resolveThreads(rawUrl: string): Promise<ResolvedMedia> {
       label: `Gambar ${item.index}` + (item.width ? ` · ${item.width}×${item.height}` : ''),
       ext: 'jpg',
       kind: 'image',
-      url: proxyUrl(item.url, 'jpg', post.title),
+      url: proxyUrl(item.url, 'jpg', post.title, post.id),
       size: null,
       note: '',
-      thumb: proxyUrl(item.url, 'jpg'),
+      thumb: proxyUrl(item.url, 'jpg', undefined, post.id),
     })
   }
   if (formats.filter((f) => f.kind === 'image').length > 1) {
@@ -232,20 +367,24 @@ async function resolveThreads(rawUrl: string): Promise<ResolvedMedia> {
       label: `Semua gambar (.zip · ${post.items.filter((i) => !i.isVideo).length} file)`,
       ext: 'zip',
       kind: 'image',
-      url: zipUrl(post.items.filter((i) => !i.isVideo).map((i) => i.url), post.title),
+      url: zipUrl(post.items.filter((i) => !i.isVideo).map((i) => i.url), post.title, post.id),
       size: null,
       note: 'satu file',
     })
   }
   if (!formats.length) {
-    throw new ApiFail('Post ini tidak berisi media yang bisa diunduh.', '', 'no_media')
+    throw new ApiFail(
+      'Post ini tidak berisi media yang bisa diunduh.',
+      'Pastikan tautannya mengarah ke post yang punya video atau gambar.',
+      'no_media',
+    )
   }
   return {
     platform: 'threads',
     title: post.title,
     author: post.author,
     thumbnail: post.thumbnail,
-    duration: null,
+    duration: post.duration,
     formats,
   }
 }
@@ -316,7 +455,7 @@ async function resolveTwitter(rawUrl: string): Promise<ResolvedMedia> {
       label: videos.length > 1 ? `Video ${i + 1}` : 'Video (audio+video)',
       ext: 'mp4',
       kind: 'video',
-      url: proxyUrl(url, 'mp4', title),
+      url: proxyUrl(url, 'mp4', title, post.id),
       size: null,
       note: '',
     })
@@ -330,10 +469,10 @@ async function resolveTwitter(rawUrl: string): Promise<ResolvedMedia> {
       label: `Gambar ${i + 1}` + (p.width ? ` · ${p.width}×${p.height}` : ''),
       ext: 'jpg',
       kind: 'image',
-      url: proxyUrl(p.url, 'jpg', title),
+      url: proxyUrl(p.url, 'jpg', title, post.id),
       size: null,
       note: '',
-      thumb: proxyUrl(p.url, 'jpg'),
+      thumb: proxyUrl(p.url, 'jpg', undefined, post.id),
     })
   })
 
@@ -343,7 +482,7 @@ async function resolveTwitter(rawUrl: string): Promise<ResolvedMedia> {
       label: `Semua gambar (.zip · ${photos.length} file)`,
       ext: 'zip',
       kind: 'image',
-      url: zipUrl(photos.map((p) => p.url), title),
+      url: zipUrl(photos.map((p) => p.url), title, post.id),
       size: null,
       note: 'satu file',
     })
@@ -375,21 +514,24 @@ function nonce(): string {
   return `${Date.now().toString(36)}-${Math.floor(Math.random() * 0xffffff).toString(36)}-${nonceSeq.toString(36)}`
 }
 
-function proxyUrl(u: string, ext?: string, title?: string): string {
+function proxyUrl(u: string, ext?: string, title?: string, postId?: string): string {
   // `e` = perkiraan ekstensi dari resolver. Dipakai kalau CDN membalas
   // content-type generik (application/octet-stream) dan URL tanpa ekstensi,
   // supaya berkas tidak tersimpan sebagai .bin.
   // `f` = judul post, dipakai sebagai dasar nama file unduhan.
+  // `p` = ID post, cadangan nama file kalau judulnya non-ASCII semua (CJK).
   const params = new URLSearchParams({ u, n: nonce() })
   if (ext) params.set('e', ext)
   if (title) params.set('f', title)
+  if (postId) params.set('p', postId)
   return `/api/dl?${params.toString()}`
 }
 
-function zipUrl(urls: string[], title?: string): string {
+function zipUrl(urls: string[], title?: string, postId?: string): string {
   const params = new URLSearchParams({ n: nonce() })
   for (const u of urls) params.append('u', u)
   if (title) params.set('f', title)
+  if (postId) params.set('p', postId)
   return `/api/zip?${params.toString()}`
 }
 
@@ -414,15 +556,14 @@ function cleanTitle(raw: string): string {
   return title.replace(/[.,;:!\- ]+$/, '').trim()
 }
 
-/** Fallback ASCII untuk header Content-Disposition. */
+/** Fallback ASCII untuk header Content-Disposition. Bisa kosong (mis. judul CJK). */
 function asciiName(name: string): string {
-  const ascii = name
+  return name
     .normalize('NFKD')
     .replace(/[^\x20-\x7e]/g, '')
     .replace(/["\\]/g, '')
     .replace(/\s+/g, ' ')
     .trim()
-  return ascii || 'download'
 }
 
 /** RFC 5987 encoding untuk filename* (UTF-8). */
@@ -439,8 +580,15 @@ function downloadName(title: string, ext: string): string {
   return `${clean ? `${clean} by ${BRAND}` : BRAND}.${ext}`
 }
 
-function contentDisposition(name: string): string {
-  return `attachment; filename="${asciiName(name)}"; filename*=UTF-8''${encodeRFC5987(name)}`
+function contentDisposition(name: string, fallbackBase = ''): string {
+  const ext = /\.([A-Za-z0-9]+)$/.exec(name)?.[1] ?? 'bin'
+  let ascii = asciiName(name)
+  const stem = ascii.replace(/\.[A-Za-z0-9]+$/, '')
+  // Judul CJK habis jadi "by PluckDL.mp4" — ganti dengan ID post.
+  if (!stem || stem === `by ${BRAND}`) {
+    ascii = `${safeName(fallbackBase, 'pluck')} by ${BRAND}.${ext}`
+  }
+  return `attachment; filename="${ascii}"; filename*=UTF-8''${encodeRFC5987(name)}`
 }
 
 /** Nama file aman dari URL post: hindari path traversal. */
@@ -469,15 +617,27 @@ function guessExt(u: string, contentType?: string): string {
 /* ------------------------------------------------------------ route logic */
 
 async function handleResolve(req: Request): Promise<Response> {
-  let body: { url?: string }
+  const limited = rateLimitResolve(req)
+  if (limited) return limited
+
+  let body: { url?: unknown }
   try {
     body = await req.json()
   } catch {
-    return json({ error: 'Body bukan JSON.', hint: '', code: 'bad_request' }, 400)
+    return json({ error: 'Body bukan JSON.', hint: 'Kirim {"url": "<tautan>"}.', code: 'bad_request' }, 400)
   }
-  const url = (body.url ?? '').trim()
+  if (!body || typeof body !== 'object' || typeof body.url !== 'string') {
+    return json(
+      { error: 'URL tidak valid.', hint: 'Field "url" harus berupa teks tautan.', code: 'invalid_url' },
+      400,
+    )
+  }
+  const url = normalizeUrl(body.url)
   if (url.length < 5 || url.length > 2000) {
-    return json({ error: 'URL tidak valid.', hint: '', code: 'invalid_url' }, 400)
+    return json(
+      { error: 'URL tidak valid.', hint: 'Tempel tautan lengkap post TikTok, Threads, atau X.', code: 'invalid_url' },
+      400,
+    )
   }
   if (!looksLikeHttpUrl(url)) {
     return json({ error: 'URL tidak valid.', hint: 'Tautan harus diawali http:// atau https://', code: 'invalid_url' }, 400)
@@ -503,10 +663,13 @@ async function handleResolve(req: Request): Promise<Response> {
   }
 }
 
-async function handleHdResolve(src: string, title: string): Promise<Response> {
+async function handleHdResolve(src: string, title: string, postId = ''): Promise<Response> {
   assertPublicHttp(src)
   if (!hostMatches(src, TIKTOK_HOSTS)) {
-    return json({ error: 'URL tidak diizinkan.', hint: '', code: 'unsafe_url' }, 400)
+    return json(
+      { error: 'URL tidak diizinkan.', hint: 'Hanya tautan TikTok yang bisa di-resolve di sini.', code: 'unsafe_url' },
+      400,
+    )
   }
   try {
     const data = await extract(src, 6)
@@ -519,7 +682,10 @@ async function handleHdResolve(src: string, title: string): Promise<Response> {
     // `f` wajib diteruskan, kalau tidak nama file jatuh ke "PluckDL.mp4".
     return new Response(null, {
       status: 302,
-      headers: { location: proxyUrl(target, 'mp4', title), 'cache-control': 'private, no-store' },
+      headers: {
+        location: proxyUrl(target, 'mp4', title, postId || postIdFromUrl(src)),
+        'cache-control': 'private, no-store',
+      },
     })
   } catch {
     return json({ error: 'Versi resolusi tertinggi tidak bisa diambil untuk video ini.', hint: 'Coba pilih "Video (no watermark)".', code: 'hd_failed' }, 400)
@@ -538,17 +704,16 @@ async function fetchMedia(url: string, range?: string): Promise<Response> {
 async function handleDownload(req: Request): Promise<Response> {
   const params = new URL(req.url).searchParams
   const src = params.get('u') ?? ''
-  if (!src) return json({ error: 'Parameter u wajib.', hint: '', code: 'bad_request' }, 400)
+  if (!src) {
+    return json({ error: 'Parameter u wajib.', hint: 'Sertakan URL media di parameter u.', code: 'bad_request' }, 400)
+  }
   assertPublicHttp(src)
   // Hanya izinkan host CDN yang relevan, bukan sembarang situs.
-  const allowed = [
-    'tiktokcdn.com', 'tiktokcdn-us.com', 'tiktokcdn-eu.com', 'tiktokv.com',
-    'byteoversea.com', 'ibyteimg.com', 'tikwm.com', 'snaptik.app', 'rapidcdn.app',
-    'cdninstagram.com', 'fbcdn.net', 'threads.com', 'threads.net',
-    'twimg.com',
-  ]
-  if (!hostMatches(src, allowed)) {
-    return json({ error: 'Host unduhan tidak diizinkan.', hint: '', code: 'unsafe_url' }, 400)
+  if (!hostMatches(src, MEDIA_HOSTS)) {
+    return json(
+      { error: 'Host unduhan tidak diizinkan.', hint: 'Hanya CDN media TikTok, Threads, atau X yang bisa dipakai.', code: 'unsafe_url' },
+      400,
+    )
   }
 
   const range = req.headers.get('range') ?? undefined
@@ -577,13 +742,14 @@ async function handleDownload(req: Request): Promise<Response> {
   const hinted = (params.get('e') ?? '').replace(/[^A-Za-z0-9]/g, '').slice(0, 5).toLowerCase()
   if (ext === 'bin' && hinted) ext = hinted
   const name = downloadName(params.get('f') ?? '', ext)
+  const fallback = params.get('p') ?? safeName(src, '')
   const headers = new Headers()
   for (const h of ['content-type', 'content-length', 'content-range', 'accept-ranges', 'etag', 'last-modified']) {
     const v = upstream.headers.get(h)
     if (v) headers.set(h, v)
   }
   if (!headers.has('content-type')) headers.set('content-type', 'application/octet-stream')
-  headers.set('content-disposition', contentDisposition(name))
+  headers.set('content-disposition', contentDisposition(name, fallback))
   // Penting: tanpa ini Cloudflare edge bisa meng-cache response upstream untuk URL
   // /api/dl?u=... dan menyajikan berkas basi ke pengguna berikutnya.
   headers.set('cache-control', 'private, no-store')
@@ -593,11 +759,24 @@ async function handleDownload(req: Request): Promise<Response> {
 }
 
 async function handleZip(req: Request): Promise<Response> {
-  const urls = [...new URL(req.url).searchParams.getAll('u')]
+  const params = new URL(req.url).searchParams
+  const urls = [...params.getAll('u')]
   if (!urls.length || urls.length > 30) {
-    return json({ error: 'Jumlah gambar tidak valid.', hint: '', code: 'bad_request' }, 400)
+    return json(
+      { error: 'Jumlah gambar tidak valid.', hint: 'Sertakan 1–30 URL gambar di parameter u.', code: 'bad_request' },
+      400,
+    )
   }
-  for (const u of urls) assertPublicHttp(u)
+  for (const u of urls) {
+    assertPublicHttp(u)
+    // Allowlist yang sama dengan /api/dl — /api/zip tidak boleh jadi proxy bebas.
+    if (!hostMatches(u, MEDIA_HOSTS)) {
+      return json(
+        { error: 'Host gambar tidak diizinkan.', hint: 'Hanya CDN media TikTok, Threads, atau X yang bisa dipakai.', code: 'unsafe_url' },
+        400,
+      )
+    }
+  }
 
   const items: Array<{ name: string; data: Uint8Array }> = []
   let i = 0
@@ -606,20 +785,22 @@ async function handleZip(req: Request): Promise<Response> {
     try {
       const res = await fetchMedia(u)
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      // Halaman login/kedaluwarsa jangan ikut dimasukkan sebagai .jpg.
+      // Halaman login/kedaluwarsa jangan ikut dimasukkan sebagai gambar.
       if (isHtmlContentType(res.headers.get('content-type') ?? '')) throw new Error('html')
       const buf = new Uint8Array(await res.arrayBuffer())
       if (!buf.length) throw new Error('empty')
-      items.push({ name: `${String(i).padStart(2, '0')}.jpg`, data: buf })
+      const guessed = guessExt(u, res.headers.get('content-type') ?? '')
+      const ext = guessed === 'bin' ? 'jpg' : guessed
+      items.push({ name: `${String(i).padStart(2, '0')}.${ext}`, data: buf })
     } catch {
       return json({ error: `Gagal mengunduh gambar ${i}.`, hint: 'Coba lagi sebentar lagi.', code: 'upstream' }, 502)
     }
   }
   const zip = makeZip(items)
-  const name = downloadName(new URL(req.url).searchParams.get('f') ?? '', 'zip')
+  const name = downloadName(params.get('f') ?? '', 'zip')
   const headers = {
     'content-type': 'application/zip',
-    'content-disposition': contentDisposition(name),
+    'content-disposition': contentDisposition(name, params.get('p') ?? ''),
     'cache-control': 'private, no-store',
   }
   if (req.method === 'HEAD') return new Response(null, { headers })
@@ -632,14 +813,17 @@ export default {
     // penangkap di sini, lemparan itu jadi 500 text/plain dari runtime dan
     // klien tidak bisa menampilkan pesan yang benar.
     try {
-      return await route(req, env)
+      return finalize(req, await route(req, env))
     } catch (err) {
       if (err instanceof ApiFail) {
-        return json({ error: err.message, hint: err.hint, code: err.code }, err.status)
+        return finalize(req, json({ error: err.message, hint: err.hint, code: err.code }, err.status))
       }
-      return json(
-        { error: 'Terjadi kesalahan tak terduga.', hint: 'Coba lagi sebentar lagi.', code: 'unknown' },
-        500,
+      return finalize(
+        req,
+        json(
+          { error: 'Terjadi kesalahan tak terduga.', hint: 'Coba lagi sebentar lagi.', code: 'unknown' },
+          500,
+        ),
       )
     }
   },
@@ -647,50 +831,75 @@ export default {
 
 async function route(req: Request, env: { ASSETS: Fetcher }): Promise<Response> {
   const url = new URL(req.url)
-    const path = url.pathname
+  const path = url.pathname
 
-    if (req.method === 'OPTIONS') {
-      return new Response(null, {
-        status: 204,
-        headers: {
-          'access-control-allow-origin': '*',
-          'access-control-allow-methods': 'GET, POST, OPTIONS',
-          'access-control-allow-headers': 'Content-Type',
-        },
-      })
-    }
+  // Paksa HTTPS + HSTS. `cf-ray` hanya ada di Cloudflare produksi; wrangler dev
+  // memetakan request lokal ke custom domain lewat HTTP, jadi jangan redirect di sana.
+  const isLocal = url.hostname === 'localhost' || url.hostname === '127.0.0.1' || url.hostname === '[::1]'
+  if (url.protocol === 'http:' && !isLocal && req.headers.get('cf-ray')) {
+    const target = new URL(url)
+    target.protocol = 'https:'
+    return new Response(null, {
+      status: 301,
+      headers: { location: target.toString(), 'cache-control': 'no-store' },
+    })
+  }
+  // Kanonik: www -> apex (butuh route www di wrangler.jsonc).
+  if (url.hostname === 'www.pluck.alva.web.id') {
+    const target = new URL(url)
+    target.hostname = 'pluck.alva.web.id'
+    return new Response(null, {
+      status: 301,
+      headers: { location: target.toString(), 'cache-control': 'no-store' },
+    })
+  }
 
-    if (path === '/api/health' && (req.method === 'GET' || req.method === 'HEAD')) {
-      return json({ ok: true, platforms: ['tiktok', 'threads', 'twitter'] })
+  if (req.method === 'OPTIONS') {
+    const cors = corsHeaders(req)
+    const headers: Record<string, string> = {
+      'access-control-allow-methods': 'GET, POST, OPTIONS',
+      'access-control-allow-headers': 'Content-Type',
+      'access-control-max-age': '86400',
     }
-    if (path === '/api/resolve' && req.method === 'POST') {
-      return handleResolve(req)
-    }
-    if (path === '/api/dl' && (req.method === 'GET' || req.method === 'HEAD')) {
-      return handleDownload(req)
-    }
-    if (path === '/api/zip' && (req.method === 'GET' || req.method === 'HEAD')) {
-      return handleZip(req)
-    }
-    if (path === '/api/hdresolve' && req.method === 'GET') {
-      return handleHdResolve(
-        url.searchParams.get('u') ?? '',
-        url.searchParams.get('f') ?? '',
-      )
-    }
+    if (cors) Object.assign(headers, cors)
+    return new Response(null, { status: 204, headers })
+  }
 
-    // Jaring pengaman: rute /api/* yang tidak dikenal JANGAN jatuh ke SPA.
-    // Tanpa ini, fallback single-page-application menyajikan index.html
-    // (text/html) — Cloudflare meng-cache-nya, lalu unduhan memakai URL itu
-    // malah tersimpan sebagai .htm. Selalu balas JSON dengan no-store.
-    if (path === '/api' || path.startsWith('/api/')) {
-      return json({ error: 'Endpoint tidak ditemukan.', hint: '', code: 'not_found' }, 404)
-    }
+  if (path === '/api/health' && (req.method === 'GET' || req.method === 'HEAD')) {
+    return json({ ok: true, platforms: ['tiktok', 'threads', 'twitter'] })
+  }
+  if (path === '/api/resolve' && req.method === 'POST') {
+    return handleResolve(req)
+  }
+  if (path === '/api/dl' && (req.method === 'GET' || req.method === 'HEAD')) {
+    return handleDownload(req)
+  }
+  if (path === '/api/zip' && (req.method === 'GET' || req.method === 'HEAD')) {
+    return handleZip(req)
+  }
+  if (path === '/api/hdresolve' && req.method === 'GET') {
+    return handleHdResolve(
+      url.searchParams.get('u') ?? '',
+      url.searchParams.get('f') ?? '',
+      url.searchParams.get('p') ?? '',
+    )
+  }
 
-    // Static assets (SPA frontend).
-    try {
-      return await env.ASSETS.fetch(req)
-    } catch {
-      return new Response('Not found', { status: 404 })
-    }
+  // Jaring pengaman: rute /api/* yang tidak dikenal JANGAN jatuh ke SPA.
+  // Tanpa ini, fallback single-page-application menyajikan index.html
+  // (text/html) — Cloudflare meng-cache-nya, lalu unduhan memakai URL itu
+  // malah tersimpan sebagai .htm. Selalu balas JSON dengan no-store.
+  if (path === '/api' || path.startsWith('/api/')) {
+    return json(
+      { error: 'Endpoint tidak ditemukan.', hint: 'Periksa kembali URL endpoint API.', code: 'not_found' },
+      404,
+    )
+  }
+
+  // Static assets (SPA frontend).
+  try {
+    return await env.ASSETS.fetch(req)
+  } catch {
+    return new Response('Not found', { status: 404 })
+  }
 }

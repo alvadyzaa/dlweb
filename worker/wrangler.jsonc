@@ -3,12 +3,13 @@
   "main": "src/index.ts",
   "compatibility_date": "2025-06-01",
   "routes": [
-    { "pattern": "pluck.alva.web.id", "custom_domain": true }
+    { "pattern": "pluck.alva.web.id", "custom_domain": true },
+    { "pattern": "www.pluck.alva.web.id", "custom_domain": true }
   ],
   "assets": {
     "directory": "../app/static",
     "binding": "ASSETS",
     "not_found_handling": "404-page",
-    "run_worker_first": ["/api/*"]
+    "run_worker_first": true
   }
 }

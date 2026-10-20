@@ -32,11 +32,16 @@ export interface ImageItem {
 }
 
 export interface ImagePost {
+  /** ID post asli (angka TikTok/Twitter, shortcode Threads). */
+  id: string
   title: string
   author: string
   thumbnail: string
+  duration: number | null
   items: ImageItem[]
 }
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
 /* ------------------------------------------------------------------ TikTok */
 
@@ -70,9 +75,11 @@ export async function tiktokPhoto(url: string): Promise<ImagePost> {
   if (!items.length) throw new ImageError('Post ini tidak berisi gambar.')
 
   return {
+    id: String(data.id ?? ''),
     title: (data.title ?? '').trim() || (author ? `TikTok ${author}` : 'Post TikTok'),
     author,
     thumbnail: data.cover ?? '',
+    duration: typeof data.duration === 'number' ? data.duration : null,
     items,
   }
 }
@@ -85,16 +92,65 @@ function scriptBlocks(html: string): string[] {
   )
 }
 
-function* findMediaNodes(node: unknown): Generator<Record<string, any>> {
+/** Shortcode post yang diminta, dari bentuk /@user/post/<kode> atau /t/<kode>. */
+function postCodeFromUrl(rawUrl: string): string | null {
+  try {
+    const m = /\/(?:post|t)\/([A-Za-z0-9_-]+)/.exec(new URL(rawUrl.trim()).pathname)
+    return m ? m[1] : null
+  } catch {
+    return null
+  }
+}
+
+/** SQL/JSON tree Threads memuat feed rekomendasi + balasan orang lain. Hanya
+ *  objek dengan `code` yang sama dengan URL yang boleh dipakai; tanpa ini post
+ *  yang tidak ada (atau quote-post) bisa mengembalikan media milik orang lain. */
+function findPostByCode(node: unknown, code: string): Record<string, any> | null {
   if (Array.isArray(node)) {
-    for (const v of node) yield* findMediaNodes(v)
+    for (const v of node) {
+      const found = findPostByCode(v, code)
+      if (found) return found
+    }
   } else if (node && typeof node === 'object') {
     const obj = node as Record<string, any>
-    if (Array.isArray(obj.carousel_media) || (obj.image_versions2 && typeof obj.image_versions2 === 'object')) {
-      yield obj
+    if (
+      String(obj.code ?? '') === code &&
+      (obj.pk != null || obj.user || obj.image_versions2 || obj.carousel_media || obj.video_versions)
+    ) {
+      return obj
     }
-    for (const v of Object.values(obj)) yield* findMediaNodes(v)
+    for (const v of Object.values(obj)) {
+      const found = findPostByCode(v, code)
+      if (found) return found
+    }
   }
+  return null
+}
+
+/** Durasi video Threads hanya ada di manifest DASH (ISO-8601). */
+function parseDashDuration(manifest: unknown): number | null {
+  if (typeof manifest !== 'string') return null
+  const raw = /mediaPresentationDuration="([^"]+)"/.exec(manifest)?.[1]
+  const m = raw ? /^PT(?:(\d+)H)?(?:(\d+)M)?(?:([\d.]+)S)?$/.exec(raw) : null
+  if (!m) return null
+  const total = Number(m[1] ?? 0) * 3600 + Number(m[2] ?? 0) * 60 + Number(m[3] ?? 0)
+  return Number.isFinite(total) && total > 0 ? total : null
+}
+
+function mediaDuration(media: Record<string, any>, entries: Record<string, any>[]): number | null {
+  if (typeof media.video_duration === 'number' && media.video_duration > 0) {
+    return media.video_duration
+  }
+  const own = parseDashDuration(media.video_dash_manifest)
+  if (own) return own
+  for (const entry of entries) {
+    if (typeof entry.video_duration === 'number' && entry.video_duration > 0) {
+      return entry.video_duration
+    }
+    const d = parseDashDuration(entry.video_dash_manifest)
+    if (d) return d
+  }
+  return null
 }
 
 function bestCandidate(media: Record<string, any>): { url: string; width: number; height: number } | null {
@@ -116,55 +172,98 @@ function bestVideo(media: Record<string, any>): string | null {
   return best?.url ?? null
 }
 
+function hasPlayableMedia(media: Record<string, any>): boolean {
+  if (bestVideo(media)) return true
+  if (Array.isArray(media.carousel_media) && media.carousel_media.length) {
+    return media.carousel_media.some(
+      (entry: Record<string, any>) => bestCandidate(entry) || bestVideo(entry),
+    )
+  }
+  return Boolean(bestCandidate(media))
+}
+
 /** Ambil media dari satu post Threads: video ATAU gambar/carousel. */
 export async function threadsPost(url: string): Promise<ImagePost & { videoUrl: string | null }> {
-  let html: string
-  try {
-    const res = await fetch(url, { headers: { 'User-Agent': UA_GOOGLEBOT } })
-    if (!res.ok) throw new ImageError(
-      'Post Threads ini tidak bisa dibuka.',
-      'Kemungkinan sudah dihapus, privat, atau hanya bisa dilihat setelah login.',
-      'not_found',
+  const code = postCodeFromUrl(url)
+  if (!code) {
+    throw new ImageError(
+      'Tautan Threads tidak valid.',
+      'Gunakan tautan ke satu post, bentuknya threads.com/@user/post/<kode>.',
+      'invalid_url',
     )
-    html = await res.text()
-  } catch (err) {
-    if (err instanceof ImageError) throw err
-    throw new ImageError('Tidak bisa menghubungi Threads.', 'Koneksi sedang bermasalah. Coba lagi sebentar lagi.', 'network')
+  }
+
+  let html = ''
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const res = await fetch(url, {
+        headers: { 'User-Agent': UA_GOOGLEBOT, Accept: 'text/html,application/xhtml+xml' },
+      })
+      if (res.status === 404) {
+        throw new ImageError(
+          'Post Threads ini tidak bisa dibuka.',
+          'Kemungkinan sudah dihapus, privat, atau hanya bisa dilihat setelah login.',
+          'not_found',
+        )
+      }
+      if (res.ok) {
+        html = await res.text()
+        break
+      }
+    } catch (err) {
+      if (err instanceof ImageError) throw err
+    }
+    if (attempt < 2) await sleep(600 * (attempt + 1))
+  }
+  if (!html) {
+    throw new ImageError(
+      'Threads sedang tidak bisa dihubungi.',
+      'Server Threads sedang bermasalah atau menolak permintaan. Coba lagi sebentar lagi.',
+      'upstream',
+    )
   }
 
   let media: Record<string, any> | null = null
-  outer: for (const block of scriptBlocks(html)) {
+  for (const block of scriptBlocks(html)) {
     let obj: unknown
     try {
       obj = JSON.parse(block)
     } catch {
       continue
     }
-    for (const node of findMediaNodes(obj)) {
-      if (Array.isArray(node.carousel_media) && node.carousel_media.length) {
-        media = node
-        break outer
-      }
-      if (bestCandidate(node) || bestVideo(node)) {
-        media = node
-        break outer
-      }
-    }
+    media = findPostByCode(obj, code)
+    if (media) break
   }
 
   if (!media) {
+    // Halaman post yang tidak ada berisi feed rekomendasi (feedData) milik akun
+    // lain. Jangan pernah memakai media dari sana.
+    if (!html.includes(code) && !html.includes('feedData')) {
+      throw new ImageError(
+        'Threads sedang tidak bisa dihubungi.',
+        'Server Threads sedang bermasalah atau menolak permintaan. Coba lagi sebentar lagi.',
+        'upstream',
+      )
+    }
     throw new ImageError(
-      'Post ini tidak berisi media.',
-      'Pastikan tautannya mengarah ke post Threads yang ada gambar atau videonya.',
-      'no_media',
+      'Post Threads ini tidak bisa dibuka.',
+      'Kemungkinan sudah dihapus, privat, atau tautannya salah.',
+      'not_found',
     )
   }
 
+  // Post quote/repost bisa menyimpan media di post yang di-quote. Pakai media
+  // itu, tapi judul/author tetap dari post terluar (bukan akun yang di-quote).
+  const share = media.text_post_app_info?.share_info
+  const shared = share?.quoted_post ?? share?.reposted_post
+  const content: Record<string, any> =
+    !hasPlayableMedia(media) && shared && hasPlayableMedia(shared) ? shared : media
+
   // Video tunggal: langsung pakai video_versions.
-  const videoUrl = bestVideo(media)
-  const entries: Record<string, any>[] = Array.isArray(media.carousel_media) && media.carousel_media.length
-    ? media.carousel_media
-    : [media]
+  const videoUrl = bestVideo(content)
+  const entries: Record<string, any>[] = Array.isArray(content.carousel_media) && content.carousel_media.length
+    ? content.carousel_media
+    : [content]
 
   const items: ImageItem[] = []
   for (const entry of entries) {
@@ -179,6 +278,14 @@ export async function threadsPost(url: string): Promise<ImagePost & { videoUrl: 
     })
   }
 
+  if (!items.length && !videoUrl) {
+    throw new ImageError(
+      'Post ini tidak berisi media.',
+      'Pastikan tautannya mengarah ke post Threads yang ada gambar atau videonya.',
+      'no_media',
+    )
+  }
+
   const user = media.user?.username ?? ''
   const caption: string = media.caption?.text ?? ''
   const title = caption.trim()
@@ -186,7 +293,15 @@ export async function threadsPost(url: string): Promise<ImagePost & { videoUrl: 
     : user
       ? `Threads ${user}`
       : 'Post Threads'
-  const thumb = bestCandidate(media)
+  const thumb = bestCandidate(media) ?? bestCandidate(content)
 
-  return { title, author: user, thumbnail: thumb?.url ?? '', items, videoUrl }
+  return {
+    id: code,
+    title,
+    author: user,
+    thumbnail: thumb?.url ?? '',
+    duration: mediaDuration(content, entries),
+    items,
+    videoUrl,
+  }
 }
